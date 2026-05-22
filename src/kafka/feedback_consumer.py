@@ -30,6 +30,13 @@ from pathlib import Path
 
 from kafka import KafkaConsumer
 
+# Latency / metrics store — graceful fallback if not yet in place
+try:
+    from latency_store import LatencyStore
+    HAS_LATENCY_STORE = True
+except ImportError:
+    HAS_LATENCY_STORE = False
+
 logging.basicConfig(
     level=logging.INFO,
     format="[%(asctime)s] %(levelname)s %(message)s",
@@ -403,10 +410,15 @@ def main():
                         help="Path to SQLite database file (created if missing)")
     parser.add_argument("--stats-every", type=int, default=20,
                         help="Print DB stats every N records (default: 20)")
+    parser.add_argument("--metrics-db", default="triage_latency.db",
+                        help="Path to shared latency/metrics SQLite DB (default: triage_latency.db)")
     args = parser.parse_args()
 
-    conn     = init_db(args.db)
-    consumer = build_consumer(args.broker, args.topic, args.group)
+    conn      = init_db(args.db)
+    consumer  = build_consumer(args.broker, args.topic, args.group)
+    lat_store = LatencyStore(args.metrics_db) if HAS_LATENCY_STORE else None
+    if lat_store:
+        log.info("Metrics DB  : %s", args.metrics_db)
     saved    = 0
 
     log.info("Listening on '%s' → writing to '%s'", args.topic, args.db)
@@ -431,6 +443,26 @@ def main():
 
                     insert_row(conn, row)
                     saved += 1
+
+                    # ── Write to shared latency store for auditability matrix ──
+                    if lat_store:
+                        try:
+                            lat_store.write_feedback(
+                                patient_id             = row.get("patient_id"),
+                                feedback_type          = row.get("feedback_type"),
+                                model_predicted_acuity = row.get("model_predicted_acuity"),
+                                final_label            = row.get("final_label"),
+                                guardrail_acuity       = row.get("guardrail_acuity"),
+                                safety_rail_triggered  = bool(row.get("safety_rail_triggered")),
+                                safety_rail_reasons    = json.loads(
+                                    row.get("safety_rail_reasons") or "[]"
+                                ),
+                                # explained_at not available here — LLM segment
+                                # is closed by kafka_consumer.py via write_message
+                                explained_at           = None,
+                            )
+                        except Exception as _lat_exc:
+                            log.warning("write_feedback failed: %s", _lat_exc)
 
                     pid    = row.get("patient_id", "?")
                     ftype  = row.get("feedback_type", "?")

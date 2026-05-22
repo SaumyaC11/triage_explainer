@@ -15,12 +15,55 @@ import argparse
 import threading
 from datetime import datetime
 
-import streamlit as st
-from kafka import KafkaConsumer, KafkaProducer
 import sys
 import os
+import importlib.util as _ilu
 
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+# ── Load latency_store by absolute path — no sys.path manipulation ────────────
+# src/kafka/ has __init__.py so adding it to sys.path shadows the kafka-python
+# package. Instead we load latency_store.py directly via importlib using its
+# absolute path, which never touches sys.path at all.
+def _load_latency_store(db_arg=None):
+    """
+    Find and load latency_store.py by walking up from this file.
+    Search order:
+      1. Same directory as streamlit_app.py          (src/streamlit/)
+      2. ../kafka/  relative to this file            (src/kafka/)
+      3. cwd/latency_store.py                        (project root, if run from there)
+      4. Path passed via --db arg's directory        (last resort)
+    """
+    candidates = [
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "latency_store.py"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "kafka", "latency_store.py"),
+        os.path.join(os.getcwd(), "latency_store.py"),
+        os.path.join(os.getcwd(), "src", "kafka", "latency_store.py"),
+    ]
+    for p in candidates:
+        p = os.path.normpath(p)
+        if os.path.exists(p):
+            spec = _ilu.spec_from_file_location("latency_store", p)
+            mod  = _ilu.module_from_spec(spec)
+            sys.modules["latency_store"] = mod
+            spec.loader.exec_module(mod)
+            print(f"[METRICS] latency_store loaded from: {p}")
+            return mod
+    return None
+
+_latency_store_mod = _load_latency_store()
+
+import streamlit as st
+import pandas as pd
+import plotly.graph_objects as go
+import plotly.express as px
+from kafka import KafkaConsumer, KafkaProducer
+
+# Latency store — loaded above via importlib, no sys.path pollution
+try:
+    from latency_store import LatencyStore
+    HAS_LATENCY_STORE = True
+except Exception:
+    HAS_LATENCY_STORE = False
+    print("[METRICS] latency_store not available — metrics tabs will be empty")
 # Streamlit does NOT call Groq — the consumer handles all LLM work.
 # We only need the escalation gate here to know whether to show
 # "pending" vs "routine" badge for patients not yet enriched.
@@ -128,7 +171,7 @@ class PatientStore:
 #  KAFKA LISTENER
 # ─────────────────────────────────────────────────────────────
 
-def kafka_listener(broker: str, topic: str, enrich_topic: str, store: PatientStore):
+def kafka_listener(broker: str, topic: str, enrich_topic: str, store: PatientStore, lat_store=None):
     """
     Subscribes to two topics:
       - triage-output      → new patient prediction records  → store.add()
@@ -142,12 +185,7 @@ def kafka_listener(broker: str, topic: str, enrich_topic: str, store: PatientSto
                 enrich_topic,
                 bootstrap_servers=[broker],
                 group_id="streamlit-triage-ui",
-                # "earliest" so a Streamlit restart doesn't miss messages already
-                # in triage-output / triage-enrichment.
-                # PatientStore deduplicates records already shown in this session.
-                auto_offset_reset="earliest",
-                enable_auto_commit=True,
-                auto_commit_interval_ms=1000,
+                auto_offset_reset="latest",
                 value_deserializer=lambda m: json.loads(m.decode("utf-8")),
                 consumer_timeout_ms=500,
             )
@@ -158,6 +196,19 @@ def kafka_listener(broker: str, topic: str, enrich_topic: str, store: PatientSto
                     if val.get("enrichment"):
                         print(f"[KAFKA] enrichment received for patient {val.get('patient_id')}")
                         store.merge_enrichment(val)
+                        #_lat = st.session_state.get("lat_store")
+                        _lat = lat_store
+                        if _lat:
+                            try:
+                                _lat.write_feedback(
+                                    patient_id             = val.get("patient_id"),
+                                    feedback_type          = "llm_explained",
+                                    model_predicted_acuity = val.get("predicted_acuity"),
+                                    final_label            = val.get("predicted_acuity"),
+                                    explained_at           = time.time(),
+                                )
+                            except Exception as _e:
+                                print(f"[METRICS] explained_at write failed: {_e}")
                     else:
                         store.add(val)
                 time.sleep(0.1)
@@ -170,17 +221,29 @@ def kafka_listener(broker: str, topic: str, enrich_topic: str, store: PatientSto
 #  SESSION INIT
 # ─────────────────────────────────────────────────────────────
 
-def init(broker: str, topic: str, enrich_topic: str):
+def init(broker: str, topic: str, enrich_topic: str, db_path: str = 'triage_latency.db'):
+    # ── 1. Latency store FIRST — must exist before thread starts ─────────────
+    if "lat_store" not in st.session_state:
+        if HAS_LATENCY_STORE:
+            try:
+                st.session_state.lat_store = LatencyStore(db_path)
+            except Exception as _e:
+                st.session_state.lat_store = None
+                print(f"[METRICS] LatencyStore init failed: {_e}")
+        else:
+            st.session_state.lat_store = None
+
+    # ── 2. Patient store + kafka listener thread ──────────────────────────────
     if "store" not in st.session_state:
         store = PatientStore()
         st.session_state.store = store
         threading.Thread(
             target=kafka_listener,
-            args=(broker, topic, enrich_topic, store),
+            args=(broker, topic, enrich_topic, store, st.session_state.lat_store),
             daemon=True,
         ).start()
 
-    # Feedback Kafka producer — publishes to triage-feedback
+    # ── 3. Feedback Kafka producer ────────────────────────────────────────────
     if "feedback_producer" not in st.session_state:
         try:
             st.session_state.feedback_producer = KafkaProducer(
@@ -628,55 +691,38 @@ def render_patient_panel(r: dict):
     render_llm_explanation(r)
 
     # ── Action buttons — only shown while pending ──────────────
-    # FIX: capture clicks as flags, then act + st.rerun() OUTSIDE the
-    # st.columns context.  Calling st.rerun() from inside a `with col:`
-    # block leaves the column container half-open; Streamlit re-emits
-    # the orphaned slot on the next render — visible as duplicate buttons
-    # on the last card in the list.
-    _accept_clicked   = False
-    _override_clicked = False
-
     if decision is None:
         b1, b2, _ = st.columns([1, 1, 6])
         with b1:
-            _accept_clicked   = st.button("✅ Accept",    key=f"accept_{pid}")
+            if st.button("✅ Accept", key=f"accept_{pid}"):
+                rails_fired       = r.get("safety_rail_triggered", False)
+                conf_issue        = r.get("confidence_state") in ("AMBIGUOUS", "LOW")
+                conflict          = r.get("has_feature_conflict", False)
+                guardrail_changed = r.get("original_acuity") != r.get("predicted_acuity")
+
+                fb_type = (
+                    "guardrail_accepted"
+                    if (guardrail_changed or rails_fired or conf_issue or conflict)
+                    else "accepted"
+                )
+
+                publish_feedback(
+                    patient=r,
+                    feedback_type=fb_type,
+                    final_label=r.get("predicted_acuity"),
+                )
+
+                if pid not in st.session_state.accepted_ids:
+                    st.session_state.accepted_ids.append(pid)
+                st.session_state.accepted_count += 1
+                st.rerun()
+
         with b2:
-            _override_clicked = st.button("✏️ Override", key=f"override_{pid}")
-
-    if _accept_clicked:
-        rails_fired       = r.get("safety_rail_triggered", False)
-        conf_issue        = r.get("confidence_state") in ("AMBIGUOUS", "LOW")
-        conflict          = r.get("has_feature_conflict", False)
-        guardrail_changed = r.get("original_acuity") != r.get("predicted_acuity")
-
-        fb_type = (
-            "guardrail_accepted"
-            if (guardrail_changed or rails_fired or conf_issue or conflict)
-            else "accepted"
-        )
-
-        publish_feedback(
-            patient=r,
-            feedback_type=fb_type,
-            final_label=r.get("predicted_acuity"),
-        )
-
-        if pid not in st.session_state.accepted_ids:
-            st.session_state.accepted_ids.append(pid)
-        st.session_state.accepted_count += 1
-        st.rerun()
-
-    if _override_clicked:
-        st.session_state.override_open[pid] = True
-        st.rerun()
+            if st.button("✏️ Override", key=f"override_{pid}"):
+                st.session_state.override_open[pid] = True
+                st.rerun()
 
     # ── Override form ──────────────────────────────────────────
-    # Initialise flags here so they are always bound, even when the
-    # override form is not open (avoids UnboundLocalError at the
-    # if _submit_clicked / if _cancel_clicked checks below).
-    _submit_clicked = False
-    _cancel_clicked = False
-
     if st.session_state.override_open.get(pid) and decision is None:
         st.markdown(
             '<div style="background:#1e1200;border-left:3px solid #e67e22;'
@@ -717,30 +763,27 @@ def render_patient_panel(r: dict):
 
         s1, s2, _ = st.columns([1, 1, 6])
         with s1:
-            _submit_clicked = st.button("✅ Submit override", key=f"submit_{pid}")
+            if st.button("✅ Submit override", key=f"submit_{pid}"):
+                if note.strip():
+                    chosen_ktas = st.session_state.override_ktas.get(pid, level)
+                    publish_feedback(
+                        patient=r,
+                        feedback_type="override",
+                        final_label=chosen_ktas,
+                        override_reason=note.strip(),
+                        override_ktas=chosen_ktas,
+                    )
+                    st.session_state.override_text[pid] = note.strip()
+                    st.session_state.decisions[pid]     = "overridden"
+                    st.session_state.override_open[pid] = False
+                    st.rerun()
+                else:
+                    st.warning("Please enter a reason before submitting.")
+
         with s2:
-            _cancel_clicked = st.button("Cancel",             key=f"cancel_{pid}")
-
-    if _submit_clicked:
-        if note.strip():
-            chosen_ktas = st.session_state.override_ktas.get(pid, level)
-            publish_feedback(
-                patient=r,
-                feedback_type="override",
-                final_label=chosen_ktas,
-                override_reason=note.strip(),
-                override_ktas=chosen_ktas,
-            )
-            st.session_state.override_text[pid] = note.strip()
-            st.session_state.decisions[pid]     = "overridden"
-            st.session_state.override_open[pid] = False
-            st.rerun()
-        else:
-            st.warning("Please enter a reason before submitting.")
-
-    if _cancel_clicked:
-        st.session_state.override_open[pid] = False
-        st.rerun()
+            if st.button("Cancel", key=f"cancel_{pid}"):
+                st.session_state.override_open[pid] = False
+                st.rerun()
 
     # ── Override note (shown after submission) ─────────────────
     if decision == "overridden" and pid in st.session_state.override_text:
@@ -766,14 +809,6 @@ def render_patient_panel(r: dict):
 # ─────────────────────────────────────────────────────────────
 
 def render_dashboard(enrich_topic: str):
-    st.set_page_config(
-        page_title="KTAS Triage Live",
-        page_icon="🏥",
-        layout="wide",
-        initial_sidebar_state="collapsed",
-    )
-    st.markdown(GLOBAL_CSS, unsafe_allow_html=True)
-
     st.markdown(
         '<h1 style="color:#E24B4A;margin-bottom:2px;">&#127973; KTAS Emergency Triage</h1>'
         '<p style="color:#666;font-size:0.85rem;margin-top:0;">'
@@ -865,28 +900,469 @@ def render_dashboard(enrich_topic: str):
         for r in filtered:
             render_patient_panel(r)
 
-    # Smart refresh: rerun when new patient OR pending enrichment arrives
-    store = st.session_state.store
-    deadline = time.time() + 10
-    while time.time() < deadline:
-        time.sleep(0.3)
-        has_new = store.consume_dirty()
-        # Check for escalation patients still awaiting their enrichment
-        has_pending_enrichment = any(
-            not r.get("llm_explanation", {}).get("is_ready")
-            and (
-                r.get("predicted_acuity") in (1, 2)
-                or r.get("safety_rail_triggered")
-                or r.get("has_feature_conflict")
-                or (r.get("true_acuity") is not None and r.get("true_acuity") != r.get("predicted_acuity"))
-            )
-            for r in store.all()
-            if r.get("patient_id") not in st.session_state.accepted_ids
-        )
-        if has_new or has_pending_enrichment:
-            break
+    # Polling and rerun handled in __main__ triage tab block
 
-    st.rerun()
+
+# ─────────────────────────────────────────────────────────────
+#  METRICS TABS
+# ─────────────────────────────────────────────────────────────
+
+KTAS_COLORS_HEX = {1: "#E24B4A", 2: "#EF9F27", 3: "#378ADD", 4: "#639922", 5: "#888780"}
+
+def _no_store_warning():
+    st.warning("Metrics DB not connected. Make sure latency_store.py is on the path and the consumer has run.")
+
+
+def render_latency_tab():
+    """
+    Tab 2 — Latency
+    ───────────────
+    Run selector  →  segment bar chart (P50 / P95)  →  per-patient scatter
+    """
+    store = st.session_state.get("lat_store")
+    if store is None:
+        _no_store_warning()
+        return
+
+    runs = store.get_runs()
+    if not runs:
+        st.info("No runs recorded yet. Start the producer and consumer.")
+        return
+
+    # ── Run selector ──────────────────────────────────────────
+    run_labels = {
+        r["run_id"]: f"{r['run_id']}  ·  {r['message_count']} msgs"
+                     + (f"  ·  P50={r['p50_e2e_ms']:.0f}ms" if r.get("p50_e2e_ms") else "  ·  (live)")
+        for r in runs
+    }
+    selected_id = st.selectbox(
+        "Select run",
+        options=list(run_labels.keys()),
+        format_func=lambda k: run_labels[k],
+        key="latency_run_sel",
+    )
+    run = next(r for r in runs if r["run_id"] == selected_id)
+
+    msgs = store.get_messages(selected_id)
+    if not msgs:
+        st.info("No messages recorded for this run yet. Make sure kafka_consumer.py is running with --db pointing to the same file.")
+        return
+
+    # ── Live aggregation from raw message rows ────────────────
+    # This works whether or not finalize_run() has been called,
+    # so data shows immediately while the consumer is still running.
+    import numpy as _np
+    def _p(col, pct):
+        vals = [m[col] for m in msgs if m.get(col) is not None]
+        return float(_np.percentile(vals, pct)) if vals else None
+
+    live = {
+        "message_count":      len(msgs),
+        "p50_e2e_ms":         _p("e2e_ms",            50),
+        "p95_e2e_ms":         _p("e2e_ms",            95),
+        "p50_kafka_ms":       _p("kafka_transit_ms",  50),
+        "p95_kafka_ms":       _p("kafka_transit_ms",  95),
+        "p50_ml_ms":          _p("ml_inference_ms",   50),
+        "p95_ml_ms":          _p("ml_inference_ms",   95),
+        "p50_safety_ms":      _p("safety_pipeline_ms",50),
+        "p95_safety_ms":      _p("safety_pipeline_ms",95),
+        "p50_llm_ms":         _p("llm_ms",            50),
+    }
+
+    # Duration and throughput from raw timestamps
+    t_vals = [m["produced_at"] for m in msgs if m.get("produced_at")]
+    s_vals = [m["safety_done_at"] for m in msgs if m.get("safety_done_at")]
+    if t_vals and s_vals:
+        _dur = max(s_vals) - min(t_vals)
+        live["duration_secs"]       = _dur
+        live["throughput_msg_sec"]  = len(msgs) / _dur if _dur > 0 else None
+    else:
+        live["duration_secs"]       = run.get("duration_secs")
+        live["throughput_msg_sec"]  = run.get("throughput_msg_sec")
+
+    # ── Summary chips ─────────────────────────────────────────
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    c1.metric("Messages",        live["message_count"])
+    c2.metric("Duration",        f"{live['duration_secs']:.1f}s"       if live.get("duration_secs")      else "—")
+    c3.metric("Throughput",      f"{live['throughput_msg_sec']:.2f} msg/s" if live.get("throughput_msg_sec") else "—")
+    c4.metric("P50 e2e",         f"{live['p50_e2e_ms']:.0f} ms"        if live.get("p50_e2e_ms")         else "—")
+    c5.metric("P95 e2e",         f"{live['p95_e2e_ms']:.0f} ms"        if live.get("p95_e2e_ms")         else "—")
+    c6.metric("LLM P50 (async)", f"{live['p50_llm_ms']:.0f} ms"        if live.get("p50_llm_ms")         else "—")
+
+    st.markdown("---")
+
+    col_left, col_right = st.columns(2)
+
+    # ── LEFT: Segment breakdown bar chart ─────────────────────
+    with col_left:
+        st.markdown(
+            '<p style="color:#aaa;font-size:0.78rem;font-weight:700;letter-spacing:.8px;">PIPELINE SEGMENT LATENCY</p>',
+            unsafe_allow_html=True,
+        )
+
+        segments = ["Kafka Transit", "ML Inference", "Safety Pipeline"]
+        colors   = ["#378ADD", "#EF9F27", "#E24B4A"]
+
+        p50_vals = [live.get("p50_kafka_ms") or 0, live.get("p50_ml_ms") or 0, live.get("p50_safety_ms") or 0]
+        p95_vals = [live.get("p95_kafka_ms") or 0, live.get("p95_ml_ms") or 0, live.get("p95_safety_ms") or 0]
+
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            name="P50 (median)",
+            x=segments, y=p50_vals,
+            marker_color=colors,
+            opacity=0.9,
+            text=[f"{v:.0f}ms" for v in p50_vals],
+            textposition="outside",
+        ))
+        fig.add_trace(go.Bar(
+            name="P95",
+            x=segments, y=p95_vals,
+            marker_color=colors,
+            opacity=0.45,
+            text=[f"{v:.0f}ms" for v in p95_vals],
+            textposition="outside",
+        ))
+        fig.update_layout(
+            barmode="group",
+            paper_bgcolor="#13131f",
+            plot_bgcolor="#13131f",
+            font=dict(color="#e0e0e0", size=12),
+            legend=dict(orientation="h", y=1.12, x=0),
+            yaxis=dict(title="ms", gridcolor="#222"),
+            xaxis=dict(gridcolor="#222"),
+            margin=dict(t=30, b=20, l=0, r=0),
+            height=320,
+        )
+
+        # LLM on secondary axis note
+        llm_p50 = live.get("p50_llm_ms")
+        llm_p95 = live.get("p95_llm_ms")
+        if llm_p50 is not None and llm_p95 is not None:
+            st.markdown(
+                f'<p style="color:#555;font-size:0.75rem;margin-bottom:4px;">'
+                f'LLM explanation (async, excluded from e2e) — P50: {llm_p50:.0f}ms · P95: {llm_p95:.0f}ms</p>',
+                unsafe_allow_html=True,
+            )
+
+        st.plotly_chart(fig, width='stretch')
+
+    # ── RIGHT: Per-patient scatter ────────────────────────────
+    with col_right:
+        st.markdown(
+            '<p style="color:#aaa;font-size:0.78rem;font-weight:700;letter-spacing:.8px;">E2E LATENCY PER PATIENT</p>',
+            unsafe_allow_html=True,
+        )
+
+        df = pd.DataFrame(msgs)
+        df["seq"]   = range(1, len(df) + 1)
+        df["rail"]  = df["safety_rail_triggered"].apply(lambda x: "Rail fired" if x else "No rail")
+        df["ktas"]  = df["predicted_acuity"].apply(lambda x: f"KTAS-{x}" if x else "Unknown")
+        df["color"] = df["predicted_acuity"].apply(
+            lambda x: KTAS_COLORS_HEX.get(x, "#888") if x else "#888"
+        )
+        df["label"] = df.apply(
+            lambda row: (
+                f"Patient: {row['patient_id']}<br>"
+                f"KTAS: {row.get('predicted_acuity','?')}<br>"
+                f"e2e: {row['e2e_ms']:.0f}ms<br>"
+                f"Rail: {'Yes' if row['safety_rail_triggered'] else 'No'}"
+            ), axis=1
+        )
+
+        fig2 = go.Figure()
+        for ktas_val, grp in df.groupby("predicted_acuity", dropna=False):
+            color = KTAS_COLORS_HEX.get(ktas_val, "#888") if ktas_val else "#888"
+            fig2.add_trace(go.Scatter(
+                x=grp["seq"],
+                y=grp["e2e_ms"],
+                mode="markers",
+                name=f"KTAS-{ktas_val}" if ktas_val else "Unknown",
+                marker=dict(color=color, size=8, opacity=0.85,
+                            symbol=["diamond" if r else "circle"
+                                    for r in grp["safety_rail_triggered"]]),
+                hovertemplate="%{text}<extra></extra>",
+                text=grp["label"],
+            ))
+
+        # Reference lines
+        if run.get("p50_e2e_ms"):
+            fig2.add_hline(y=run["p50_e2e_ms"], line_dash="dot",
+                          line_color="#639922", opacity=0.6,
+                          annotation_text="P50", annotation_font_color="#639922")
+        if run.get("p95_e2e_ms"):
+            fig2.add_hline(y=run["p95_e2e_ms"], line_dash="dot",
+                          line_color="#E24B4A", opacity=0.6,
+                          annotation_text="P95", annotation_font_color="#E24B4A")
+
+        fig2.update_layout(
+            paper_bgcolor="#13131f",
+            plot_bgcolor="#13131f",
+            font=dict(color="#e0e0e0", size=12),
+            legend=dict(orientation="h", y=1.12, x=0),
+            yaxis=dict(title="e2e latency (ms)", gridcolor="#222"),
+            xaxis=dict(title="Patient sequence", gridcolor="#222"),
+            margin=dict(t=30, b=20, l=0, r=0),
+            height=320,
+        )
+        st.markdown(
+            '<p style="color:#555;font-size:0.75rem;margin-bottom:4px;">'
+            'Diamond markers = safety rail fired · Hover for patient detail</p>',
+            unsafe_allow_html=True,
+        )
+        st.plotly_chart(fig2, width='stretch')
+
+
+def render_throughput_tab():
+    """
+    Tab 3 — Throughput
+    ──────────────────
+    One row per run — ablation table comparing runs side by side.
+    """
+    store = st.session_state.get("lat_store")
+    if store is None:
+        _no_store_warning()
+        return
+
+    runs = store.get_runs()
+    if not runs:
+        st.info("No runs recorded yet. Run the producer and consumer.")
+        return
+
+    st.markdown(
+        '<p style="color:#aaa;font-size:0.78rem;font-weight:700;letter-spacing:.8px;">RUN COMPARISON TABLE</p>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        '<p style="color:#555;font-size:0.75rem;margin-top:-8px;">'
+        'Each row is one producer run. Use --run-id to label ablation experiments.</p>',
+        unsafe_allow_html=True,
+    )
+
+    import numpy as _np2
+
+    def _fmt(val, suffix="", decimals=1):
+        if val is None:
+            return "—"
+        return f"{val:.{decimals}f}{suffix}"
+
+    def _live_agg(run_id):
+        """Compute live aggregates from raw message rows for any run."""
+        msgs = store.get_messages(run_id)
+        if not msgs:
+            return {}
+        def _p(col, pct):
+            vals = [m[col] for m in msgs if m.get(col) is not None]
+            return float(_np2.percentile(vals, pct)) if vals else None
+        t_vals = [m["produced_at"] for m in msgs if m.get("produced_at")]
+        s_vals = [m["safety_done_at"] for m in msgs if m.get("safety_done_at")]
+        dur    = (max(s_vals) - min(t_vals)) if t_vals and s_vals else None
+        rail_hits = sum(1 for m in msgs if m.get("safety_rail_triggered"))
+        return {
+            "n":          len(msgs),
+            "duration":   dur,
+            "throughput": len(msgs) / dur if dur else None,
+            "p50_e2e":    _p("e2e_ms",             50),
+            "p95_e2e":    _p("e2e_ms",             95),
+            "p50_kafka":  _p("kafka_transit_ms",   50),
+            "p50_ml":     _p("ml_inference_ms",    50),
+            "p50_safety": _p("safety_pipeline_ms", 50),
+            "rail_rate":  rail_hits / len(msgs) * 100 if msgs else None,
+        }
+
+    rows = []
+    for r in runs:
+        a = _live_agg(r["run_id"])
+        rows.append({
+            "Run ID":          r["run_id"],
+            "Started":         r.get("started_at", "")[:16].replace("T", " "),
+            "Messages":        a.get("n", r.get("message_count", 0)),
+            "Duration (s)":    _fmt(a.get("duration"), "s"),
+            "Throughput":      _fmt(a.get("throughput"), " msg/s", 2),
+            "P50 e2e (ms)":    _fmt(a.get("p50_e2e"), "ms", 0),
+            "P95 e2e (ms)":    _fmt(a.get("p95_e2e"), "ms", 0),
+            "P50 Kafka (ms)":  _fmt(a.get("p50_kafka"), "ms", 0),
+            "P50 ML (ms)":     _fmt(a.get("p50_ml"), "ms", 0),
+            "P50 Safety (ms)": _fmt(a.get("p50_safety"), "ms", 0),
+            "Rail hit rate":   _fmt(a.get("rail_rate"), "%"),
+            "Status":          "✓ Finalized" if r.get("finalized") else "⏳ Live",
+        })
+
+    df = pd.DataFrame(rows)
+    st.dataframe(
+        df,
+        width='stretch',
+        hide_index=True,
+        column_config={
+            "Run ID":      st.column_config.TextColumn(width="medium"),
+            "Started":     st.column_config.TextColumn(width="small"),
+            "Status":      st.column_config.TextColumn(width="small"),
+        },
+    )
+
+    # Throughput sparkline across runs (if >1 run)
+    # Build sparkline data from live aggregates (already computed in rows above)
+    spark_data = [(r["Run ID"], r["Throughput"]) for r in rows if r["Throughput"] != "—"]
+    if len(spark_data) > 1:
+        spark_x  = [d[0] for d in spark_data]
+        spark_y  = [float(d[1].replace(" msg/s","")) for d in spark_data]
+        st.markdown("---")
+        st.markdown(
+            '<p style="color:#aaa;font-size:0.78rem;font-weight:700;letter-spacing:.8px;">THROUGHPUT ACROSS RUNS</p>',
+            unsafe_allow_html=True,
+        )
+        fig = go.Figure()
+        fig.add_trace(go.Bar(
+            x=spark_x,
+            y=spark_y,
+            marker_color="#378ADD",
+            text=[f"{v:.2f}" for v in spark_y],
+            textposition="outside",
+        ))
+        fig.update_layout(
+            paper_bgcolor="#13131f",
+            plot_bgcolor="#13131f",
+            font=dict(color="#e0e0e0", size=11),
+            yaxis=dict(title="msg/sec", gridcolor="#222"),
+            xaxis=dict(tickangle=-30),
+            margin=dict(t=20, b=60, l=0, r=0),
+            height=260,
+            showlegend=False,
+        )
+        st.plotly_chart(fig, width='stretch')
+    elif len(runs) == 1:
+        st.markdown(
+            '<p style="color:#555;font-size:0.78rem;">Run more producer runs to compare throughput across experiments.</p>',
+            unsafe_allow_html=True,
+        )
+
+
+def render_auditability_tab():
+    """
+    Tab 4 — Auditability
+    ─────────────────────
+    Override confusion matrix  +  safety rail reason ranked list.
+    """
+    store = st.session_state.get("lat_store")
+    if store is None:
+        _no_store_warning()
+        return
+
+    matrix  = store.get_override_matrix()
+    reasons = store.get_rail_reasons()
+
+    if not matrix and not reasons:
+        st.info("No clinician feedback recorded yet. Accept or override patients in the Triage tab.")
+        return
+
+    col_left, col_right = st.columns([3, 2])
+
+    # ── LEFT: Override confusion matrix ──────────────────────
+    with col_left:
+        st.markdown(
+            '<p style="color:#aaa;font-size:0.78rem;font-weight:700;letter-spacing:.8px;">CLINICIAN OVERRIDE MATRIX</p>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            '<p style="color:#555;font-size:0.75rem;margin-top:-8px;">'
+            'Rows = model prediction · Columns = clinician final label · '
+            'Diagonal = accepted · Off-diagonal = corrected</p>',
+            unsafe_allow_html=True,
+        )
+
+        ktas_levels = [1, 2, 3, 4, 5]
+        z = [[matrix.get(pred, {}).get(label, 0) for label in ktas_levels]
+             for pred in ktas_levels]
+
+        # Custom text — show count, blank for zeros
+        text = [[str(val) if val > 0 else "" for val in row] for row in z]
+
+        # Color scale: diagonal (correct) green, off-diagonal red
+        # Build a custom colorscale
+        fig = go.Figure(go.Heatmap(
+            z=z,
+            x=[f"Label KTAS-{l}" for l in ktas_levels],
+            y=[f"Pred KTAS-{p}" for p in ktas_levels],
+            text=text,
+            texttemplate="%{text}",
+            textfont=dict(size=16, color="white"),
+            colorscale=[
+                [0.0, "#13131f"],
+                [0.5, "#1a4a2e"],
+                [1.0, "#2ecc71"],
+            ],
+            showscale=False,
+            hoverongaps=False,
+            hovertemplate="Model predicted: %{y}<br>Clinician label: %{x}<br>Count: %{z}<extra></extra>",
+        ))
+
+        # Overlay diagonal cells with a different color to highlight correct predictions
+        for i, ktas in enumerate(ktas_levels):
+            val = matrix.get(ktas, {}).get(ktas, 0)
+            if val > 0:
+                fig.add_shape(
+                    type="rect",
+                    x0=i - 0.5, x1=i + 0.5,
+                    y0=i - 0.5, y1=i + 0.5,
+                    line=dict(color="#2ecc71", width=2),
+                    fillcolor="rgba(46,204,113,0.15)",
+                )
+
+        fig.update_layout(
+            paper_bgcolor="#13131f",
+            plot_bgcolor="#13131f",
+            font=dict(color="#e0e0e0", size=12),
+            margin=dict(t=10, b=10, l=0, r=0),
+            height=340,
+            xaxis=dict(side="bottom"),
+            yaxis=dict(autorange="reversed"),
+        )
+        st.plotly_chart(fig, width='stretch')
+
+        # Summary line
+        total_decisions = sum(sum(row.values()) for row in matrix.values())
+        diagonal        = sum(matrix.get(k, {}).get(k, 0) for k in ktas_levels)
+        off_diag        = total_decisions - diagonal
+        if total_decisions > 0:
+            st.markdown(
+                f'<p style="color:#555;font-size:0.78rem;">'
+                f'Total decisions: {total_decisions} · '
+                f'Accepted (diagonal): {diagonal} ({diagonal/total_decisions*100:.0f}%) · '
+                f'Corrected (off-diagonal): {off_diag} ({off_diag/total_decisions*100:.0f}%)</p>',
+                unsafe_allow_html=True,
+            )
+
+    # ── RIGHT: Safety rail reason ranked list ────────────────
+    with col_right:
+        st.markdown(
+            '<p style="color:#aaa;font-size:0.78rem;font-weight:700;letter-spacing:.8px;">SAFETY RAIL TRIGGERS</p>',
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            '<p style="color:#555;font-size:0.75rem;margin-top:-8px;">'
+            'Ranked by frequency across all overridden/accepted patients</p>',
+            unsafe_allow_html=True,
+        )
+
+        if not reasons:
+            st.markdown('<p style="color:#555;font-size:0.84rem;">No rail triggers recorded yet.</p>',
+                        unsafe_allow_html=True)
+        else:
+            max_count = reasons[0][1] if reasons else 1
+            for reason, count in reasons:
+                pct_bar = int(count / max_count * 100)
+                st.markdown(
+                    f'<div style="margin-bottom:10px;">'
+                    f'<div style="display:flex;justify-content:space-between;margin-bottom:3px;">'
+                    f'<span style="color:#ddd;font-size:0.82rem;">{reason}</span>'
+                    f'<span style="color:#EF9F27;font-size:0.82rem;font-weight:700;">{count}</span>'
+                    f'</div>'
+                    f'<div style="background:#1a1a2e;border-radius:3px;height:6px;">'
+                    f'<div style="background:#EF9F27;width:{pct_bar}%;height:6px;border-radius:3px;"></div>'
+                    f'</div>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -899,10 +1375,64 @@ def parse_args():
     p.add_argument("--topic",        default="triage-output")
     p.add_argument("--enrich-topic", default="triage-enrichment",
                    help="Topic consumer publishes LLM enrichment to (must match --enrich-topic on consumer)")
+    p.add_argument("--db",           default="triage_latency.db",
+                   help="Path to shared latency/metrics SQLite DB (default: triage_latency.db)")
     return p.parse_args()
 
 
 if __name__ == "__main__":
     args = parse_args()
-    init(args.broker, args.topic, args.enrich_topic)
-    render_dashboard(args.enrich_topic)
+
+    st.set_page_config(
+        page_title="KTAS Triage",
+        page_icon="🏥",
+        layout="wide",
+        initial_sidebar_state="collapsed",
+    )
+    st.markdown(GLOBAL_CSS, unsafe_allow_html=True)
+
+    init(args.broker, args.topic, args.enrich_topic, args.db)
+
+    tab_triage, tab_latency, tab_throughput, tab_audit = st.tabs([
+        "🏥 Triage",
+        "⏱ Latency",
+        "📊 Throughput",
+        "🔍 Auditability",
+    ])
+
+    with tab_triage:
+        render_dashboard(args.enrich_topic)
+
+    with tab_latency:
+        render_latency_tab()
+
+    with tab_throughput:
+        render_throughput_tab()
+
+    with tab_audit:
+        render_auditability_tab()
+
+    # ── Polling loop — outside all tab blocks so it always runs ──────────────
+    # Streamlit executes __main__ top-to-bottom on every rerun regardless of
+    # which tab is active. Placing st.rerun() here means the page refreshes
+    # on new Kafka data no matter which tab the user is viewing.
+    _store    = st.session_state.store
+    _deadline = time.time() + 10
+    while time.time() < _deadline:
+        time.sleep(0.3)
+        _has_new = _store.consume_dirty()
+        _has_pending = any(
+            not r.get("llm_explanation", {}).get("is_ready")
+            and (
+                r.get("predicted_acuity") in (1, 2)
+                or r.get("safety_rail_triggered")
+                or r.get("has_feature_conflict")
+                or (r.get("true_acuity") is not None
+                    and r.get("true_acuity") != r.get("predicted_acuity"))
+            )
+            for r in _store.all()
+            if r.get("patient_id") not in st.session_state.accepted_ids
+        )
+        if _has_new or _has_pending:
+            break
+    st.rerun()

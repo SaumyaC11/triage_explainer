@@ -148,10 +148,13 @@ def _sample_categorical(subset: pd.DataFrame, col: str):
 #  MAIN GENERATE FUNCTION
 # ─────────────────────────────────────────────────────────────
 
-def generate_patient(acuity: int = None, csv_path: str = "data.csv") -> dict:
+def generate_patient(acuity: int = None, csv_path: str = "data.csv", run_id: str = None) -> dict:
     """
     Generate one synthetic patient record whose vitals and demographics
     are sampled from the real data distribution for the given acuity level.
+
+    run_id is stamped on every record so kafka_consumer.py can group messages
+    into runs for latency and throughput measurement.
     """
     _load_real_data(csv_path)
 
@@ -164,6 +167,7 @@ def generate_patient(acuity: int = None, csv_path: str = "data.csv") -> dict:
         "patient_id":  str(uuid.uuid4())[:8].upper(),
         "timestamp":   datetime.now().isoformat(),
         "produced_at": time.time(),     # epoch float — used for latency calculation
+        "run_id":      run_id,          # groups messages into a single measurable run
         "true_acuity": acuity,
     }
 
@@ -219,7 +223,13 @@ def main():
                         help="Seconds between messages (default: 2)")
     parser.add_argument("--count",    type=int,   default=0,
                         help="Total messages to send (0 = infinite)")
+    parser.add_argument("--run-id",   default=None,
+                        help="Human-readable run label (default: auto timestamp YYYYMMDD_HHMMSS)")
     args = parser.parse_args()
+
+    # Generate run_id once — shared across all messages in this run.
+    # Auto-format: YYYYMMDD_HHMMSS so runs sort chronologically in the metrics tab.
+    run_id = args.run_id or datetime.now().strftime("%Y%m%d_%H%M%S")
 
     producer = build_producer(args.broker)
     sent     = 0
@@ -227,12 +237,13 @@ def main():
     print(f"[PRODUCER] Broker  : {args.broker}")
     print(f"[PRODUCER] Topic   : {args.topic}")
     print(f"[PRODUCER] CSV     : {args.csv}")
+    print(f"[PRODUCER] Run ID  : {run_id}")
     print(f"[PRODUCER] Interval: {args.interval}s | "
           f"Count: {'∞' if args.count == 0 else args.count}\n")
 
     try:
         while args.count == 0 or sent < args.count:
-            patient = generate_patient(csv_path=args.csv)
+            patient = generate_patient(csv_path=args.csv, run_id=run_id)
             pid     = patient["patient_id"]
             acuity  = patient["true_acuity"]
 

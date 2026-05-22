@@ -33,6 +33,14 @@ import os
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
+# Latency / metrics store — graceful fallback if file not yet in place
+try:
+    from latency_store import LatencyStore
+    HAS_LATENCY_STORE = True
+except ImportError:
+    HAS_LATENCY_STORE = False
+    print("[CONSUMER] ⚠ latency_store not found — metrics will not be recorded")
+
 
 # Groq enrichment — optional, only fires on escalation rails
 try:
@@ -651,24 +659,31 @@ def detect_feature_conflicts(result: dict, raw_record: dict) -> dict:
 #  PIPELINE ORCHESTRATOR
 # =============================================================================
 
-def run_safety_pipeline(bundle: dict, raw_record: dict) -> dict:
+def run_safety_pipeline(bundle: dict, raw_record: dict) -> tuple:
     """
     Full pipeline:
-      predict_patient()  →  safety rails  →  confidence  →  conflict detection
+      predict_patient()  ->  safety rails  ->  confidence  ->  conflict detection
 
-    Returns a clean result dict (internal fields stripped).
+    Returns (result, timing) where timing is a dict of epoch floats:
+        ml_done_at      -- after predict_patient() completes
+        safety_done_at  -- after all three safety layers complete
+
+    The caller stamps consumer_received_at just before calling this function.
     """
-    # Raw ML prediction
-    result = predict_patient(bundle, raw_record)
+    # Raw ML prediction -- stamp after inference completes
+    result     = predict_patient(bundle, raw_record)
+    ml_done_at = time.time()
 
-    # Layer 1 — deterministic safety rails (runs first, sets hard floors)
+    # Layer 1 -- deterministic safety rails (runs first, sets hard floors)
     result = apply_safety_rails(result, raw_record)
 
-    # Layer 2 — confidence classification and resolution
+    # Layer 2 -- confidence classification and resolution
     result = classify_and_resolve_confidence(result)
 
-    # Layer 3 — feature conflict detection
+    # Layer 3 -- feature conflict detection
     result = detect_feature_conflicts(result, raw_record)
+
+    safety_done_at = time.time()
 
     # Sync final label/color after all layers
     final_acuity           = result["predicted_acuity"]
@@ -689,7 +704,11 @@ def run_safety_pipeline(bundle: dict, raw_record: dict) -> dict:
     # Strip internal working fields before publishing
     result.pop("_proba_by_class", None)
 
-    return result
+    timing = {
+        "ml_done_at":     ml_done_at,
+        "safety_done_at": safety_done_at,
+    }
+    return result, timing
 
 
 # =============================================================================
@@ -849,6 +868,8 @@ def main():
                         help="Groq API key (or set GROQ_API_KEY env var)")
     parser.add_argument("--no-enrich",      action="store_true",
                         help="Disable Groq enrichment entirely")
+    parser.add_argument("--db",             default="triage_latency.db",
+                        help="Path to SQLite latency/metrics DB (default: triage_latency.db)")
     args = parser.parse_args()
 
     # Resolve Groq API key: CLI > env var
@@ -858,6 +879,11 @@ def main():
     bundle   = load_model_bundle(args.model)
     consumer = build_consumer(args.broker, args.in_topic, args.group)
     producer = build_producer(args.broker)
+
+    # Latency store — opened once, shared across all messages in this process
+    lat_store = LatencyStore(args.db) if HAS_LATENCY_STORE else None
+    if lat_store:
+        print(f"[CONSUMER] Metrics DB   : {args.db}")
 
     icons      = {1: "🔴", 2: "🟠", 3: "🔵", 4: "🟢", 5: "⚪"}
     conf_icons = {"HIGH": "✓", "MODERATE": "~", "AMBIGUOUS": "⚠", "LOW": "!", "UNKNOWN": "?"}
@@ -892,7 +918,8 @@ def main():
             for msg in consumer:
                 record = msg.value
                 try:
-                    result = run_safety_pipeline(bundle, record)
+                    consumer_received_at = time.time()       # stamp before pipeline
+                    result, timing = run_safety_pipeline(bundle, record)
 
                     # ── Step 1: publish raw result immediately ─────────────────
                     producer.send(args.out_topic,
@@ -900,6 +927,24 @@ def main():
                                   value=result)
                     producer.flush()
                     processed += 1
+
+                    # ── Latency store: write one row per message ───────────────
+                    if lat_store:
+                        run_id = record.get("run_id") or "unknown"
+                        try:
+                            lat_store.write_message(
+                                run_id               = run_id,
+                                patient_id           = result["patient_id"],
+                                produced_at          = record.get("produced_at", consumer_received_at),
+                                consumer_received_at = consumer_received_at,
+                                ml_done_at           = timing["ml_done_at"],
+                                safety_done_at       = timing["safety_done_at"],
+                                safety_rail_triggered= result.get("safety_rail_triggered", False),
+                                true_acuity          = result.get("true_acuity"),
+                                predicted_acuity     = result.get("predicted_acuity"),
+                            )
+                        except Exception as _lat_exc:
+                            print(f"  [METRICS] write_message failed: {_lat_exc}")
 
                     # ── Step 2: fire Groq enrichment in background thread ──────
                     if groq_enabled:
@@ -974,6 +1019,23 @@ def main():
             print(f"  Conflict hits   : {conflict_hits}  ({conflict_hits/processed*100:.1f}%)")
             if groq_enabled:
                 print(f"  Enrich fired    : {enrich_fired}  ({enrich_fired/processed*100:.1f}% of patients)")
+        # Finalize all runs seen in this session
+        if lat_store and processed > 0:
+            seen_runs = set()
+            try:
+                import sqlite3
+                conn = sqlite3.connect(args.db)
+                rows = conn.execute("SELECT DISTINCT run_id FROM messages").fetchall()
+                seen_runs = {r[0] for r in rows}
+                conn.close()
+            except Exception:
+                pass
+            for rid in seen_runs:
+                try:
+                    lat_store.finalize_run(rid)
+                    print(f"[CONSUMER] Finalized run: {rid}")
+                except Exception as _fe:
+                    print(f"[CONSUMER] finalize_run failed for {rid}: {_fe}")
     finally:
         consumer.close()
         producer.close()
