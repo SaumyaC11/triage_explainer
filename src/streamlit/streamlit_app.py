@@ -201,11 +201,12 @@ def kafka_listener(broker: str, topic: str, enrich_topic: str, store: PatientSto
                         if _lat:
                             try:
                                 _lat.write_feedback(
-                                    patient_id             = val.get("patient_id"),
-                                    feedback_type          = "llm_explained",
-                                    model_predicted_acuity = val.get("predicted_acuity"),
-                                    final_label            = val.get("predicted_acuity"),
-                                    explained_at           = time.time(),
+                                    patient_id               = val.get("patient_id"),
+                                    feedback_type            = "llm_explained",
+                                    model_predicted_acuity   = val.get("predicted_acuity"),
+                                    final_label              = val.get("predicted_acuity"),
+                                    explained_at             = time.time(),
+                                    enrichment_requested_at  = val.get("enrichment_requested_at"),
                                 )
                             except Exception as _e:
                                 print(f"[METRICS] explained_at write failed: {_e}")

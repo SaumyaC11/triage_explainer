@@ -233,20 +233,27 @@ class LatencyStore:
 
     def write_feedback(
         self,
-        patient_id:             str,
-        feedback_type:          str,
-        model_predicted_acuity: Optional[int],
-        final_label:            Optional[int],
-        guardrail_acuity:       Optional[int]  = None,
-        safety_rail_triggered:  bool           = False,
-        safety_rail_reasons:    list           = None,
-        explained_at:           Optional[float] = None,
+        patient_id:              str,
+        feedback_type:           str,
+        model_predicted_acuity:  Optional[int],
+        final_label:             Optional[int],
+        guardrail_acuity:        Optional[int]  = None,
+        safety_rail_triggered:   bool           = False,
+        safety_rail_reasons:     list           = None,
+        explained_at:            Optional[float] = None,
+        enrichment_requested_at: Optional[float] = None,
     ):
         """
-        Called by feedback_consumer.py when a clinician decision arrives.
+        Called by feedback_consumer.py or kafka_listener (streamlit) when a
+        clinician decision or LLM explanation arrives.
 
         1. Writes to `overrides` table for the auditability matrix.
         2. Updates `messages.explained_at` + `llm_ms` if explained_at is set.
+
+        llm_ms = (explained_at - enrichment_requested_at) * 1000
+            — time from LLM request being dispatched to explanation arriving.
+        If enrichment_requested_at is None, falls back to safety_done_at
+        (less accurate but still recorded).
         """
         # 1 — auditability row
         self._conn.execute("""
@@ -265,13 +272,29 @@ class LatencyStore:
 
         # 2 — close the LLM segment if we have explained_at
         if explained_at is not None:
-            self._conn.execute("""
-                UPDATE messages
-                SET    explained_at = ?,
-                       llm_ms = (? - safety_done_at) * 1000
-                WHERE  patient_id = ?
-                  AND  explained_at IS NULL
-            """, (explained_at, explained_at, patient_id))
+            if enrichment_requested_at is not None:
+                # Accurate: time from LLM dispatch to explanation received
+                llm_ms_expr = (explained_at - enrichment_requested_at) * 1000
+            else:
+                # Fallback: diff from safety_done_at (includes queue time)
+                llm_ms_expr = None
+
+            if llm_ms_expr is not None:
+                self._conn.execute("""
+                    UPDATE messages
+                    SET    explained_at = ?,
+                           llm_ms       = ?
+                    WHERE  patient_id   = ?
+                      AND  explained_at IS NULL
+                """, (explained_at, llm_ms_expr, patient_id))
+            else:
+                self._conn.execute("""
+                    UPDATE messages
+                    SET    explained_at = ?,
+                           llm_ms = (? - safety_done_at) * 1000
+                    WHERE  patient_id   = ?
+                      AND  explained_at IS NULL
+                """, (explained_at, explained_at, patient_id))
 
         self._conn.commit()
 
