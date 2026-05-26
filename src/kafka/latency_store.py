@@ -31,39 +31,6 @@ Written by feedback_consumer.py via write_feedback().
 Stored in the `messages` table (explained_at + llm_ms) and the
 `overrides` table (model prediction vs clinician final label).
 
-Usage
------
-    from latency_store import LatencyStore
-    store = LatencyStore()                        # default: triage_latency.db
-    store = LatencyStore("path/to/custom.db")
-
-    # kafka_consumer.py — per message
-    store.write_message(
-        run_id             = "20260520_143201",
-        patient_id         = "A1B2C3D4",
-        produced_at        = 1716220321.123,
-        consumer_received_at = 1716220321.456,
-        ml_done_at         = 1716220321.789,
-        safety_done_at     = 1716220321.901,
-    )
-
-    # kafka_consumer.py — end of run
-    store.finalize_run("20260520_143201")
-
-    # feedback_consumer.py — when LLM explanation arrives or clinician acts
-    store.write_feedback(
-        patient_id             = "A1B2C3D4",
-        explained_at           = 1716220335.0,   # None if not yet explained
-        feedback_type          = "override",
-        model_predicted_acuity = 3,
-        final_label            = 2,
-    )
-
-    # streamlit tabs — read side
-    runs     = store.get_runs()                  # list[dict]
-    msgs     = store.get_messages(run_id)        # list[dict]
-    matrix   = store.get_override_matrix()       # dict[int, dict[int, int]]
-    reasons  = store.get_rail_reasons()          # list[(reason_str, count)]
 """
 
 import json
@@ -255,20 +222,21 @@ class LatencyStore:
         If enrichment_requested_at is None, falls back to safety_done_at
         (less accurate but still recorded).
         """
-        # 1 — auditability row
-        self._conn.execute("""
-            INSERT INTO overrides (
+        # 1 — auditability row (skip for llm_explained — that's not a clinician decision)
+        if feedback_type != "llm_explained":
+            self._conn.execute("""
+                INSERT INTO overrides (
+                    patient_id, feedback_type,
+                    model_predicted_acuity, guardrail_acuity, final_label,
+                    safety_rail_triggered, safety_rail_reasons, submitted_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
                 patient_id, feedback_type,
                 model_predicted_acuity, guardrail_acuity, final_label,
-                safety_rail_triggered, safety_rail_reasons, submitted_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            patient_id, feedback_type,
-            model_predicted_acuity, guardrail_acuity, final_label,
-            int(safety_rail_triggered),
-            json.dumps(safety_rail_reasons or []),
-            datetime.now().isoformat(),
-        ))
+                int(safety_rail_triggered),
+                json.dumps(safety_rail_reasons or []),
+                datetime.now().isoformat(),
+            ))
 
         # 2 — close the LLM segment if we have explained_at
         if explained_at is not None:
@@ -418,11 +386,20 @@ class LatencyStore:
         Return a ranked list of (reason_text, count) for all fired safety rails.
         Parses the JSON-encoded safety_rail_reasons column.
 
+        Deduplicates by patient_id — one patient counts once per reason even
+        if they have multiple override rows (e.g. accepted then overridden).
+
         Returns: [(reason_str, count), ...] sorted by count descending.
         """
-        rows = self._conn.execute(
-            "SELECT safety_rail_reasons FROM overrides WHERE safety_rail_triggered = 1"
-        ).fetchall()
+        # Use DISTINCT patient_id + safety_rail_reasons to avoid double-counting
+        rows = self._conn.execute("""
+            SELECT DISTINCT patient_id, safety_rail_reasons
+            FROM overrides
+            WHERE safety_rail_triggered = 1
+              AND safety_rail_reasons IS NOT NULL
+              AND safety_rail_reasons != '[]'
+              AND safety_rail_reasons != ''
+        """).fetchall()
 
         counts: dict = {}
         for r in rows:
@@ -431,7 +408,8 @@ class LatencyStore:
                 for reason in reasons:
                     # Trim to the human-readable part before " → "
                     label = str(reason).split("→")[0].strip() if "→" in str(reason) else str(reason)
-                    counts[label] = counts.get(label, 0) + 1
+                    if label:
+                        counts[label] = counts.get(label, 0) + 1
             except (json.JSONDecodeError, TypeError):
                 pass
 

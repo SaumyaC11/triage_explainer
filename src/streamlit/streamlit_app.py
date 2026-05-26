@@ -19,10 +19,7 @@ import sys
 import os
 import importlib.util as _ilu
 
-# ── Load latency_store by absolute path — no sys.path manipulation ────────────
-# src/kafka/ has __init__.py so adding it to sys.path shadows the kafka-python
-# package. Instead we load latency_store.py directly via importlib using its
-# absolute path, which never touches sys.path at all.
+
 def _load_latency_store(db_arg=None):
     """
     Find and load latency_store.py by walking up from this file.

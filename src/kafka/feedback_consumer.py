@@ -15,8 +15,6 @@ The `final_label` column is the ground-truth KTAS to use for retraining:
   - guardrail_accepted → same as accepted (post-guardrail level)
 
 Usage:
-    pip install kafka-python
-    python feedback_consumer.py
     python feedback_consumer.py --broker localhost:9092 --topic triage-feedback --db triage_feedback.db
 """
 

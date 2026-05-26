@@ -2,39 +2,6 @@
 triage_explainer.py
 ===================
 LLM-powered explainability engine for the KTAS triage system.
-Completely decoupled from Streamlit — import and call from anywhere.
-
-Uses Groq API (free tier) — hosts Llama 3, Mixtral, Gemma2 etc.
-No local installation needed. Just a free API key.
-
-    Sign up : https://console.groq.com  (free, no credit card)
-    API key : https://console.groq.com/keys
-    Set key : export GROQ_API_KEY="gsk_..."
-              OR pass api_key= directly to TriageExplainer()
-
-    Free tier limits (as of 2025):
-        llama-3.3-70b-versatile  — 6,000 tokens/min,  500 req/day
-        llama-3.1-8b-instant     — 20,000 tokens/min, 14,400 req/day  ← fastest
-        mixtral-8x7b-32768       — 5,000 tokens/min,  14,400 req/day
-        gemma2-9b-it             — 15,000 tokens/min, 14,400 req/day
-
-    pip install groq
-
-Usage:
-    from triage_explainer import TriageExplainer, needs_escalation_review
-
-    # Check BEFORE calling Groq — only escalations/conflicts get LLM review
-    if needs_escalation_review(patient_record):
-        explainer.explain_async(patient_record)
-
-    result = explainer.get(patient_id)
-
-    print(result.escalation_reason)
-    print(result.patient_summary)
-    print(result.risk_flags)
-    print(result.confidence_note)
-    print(result.full_text)
-    print(result.is_ready)
 
 Groq API is ONLY invoked when a patient triggers one or more escalation rails:
   1. CONFLICT    — true_acuity ≠ predicted_acuity (model disagreement)
@@ -545,17 +512,6 @@ class TriageExplainer:
     - explain_async() is non-blocking — safe in Streamlit's refresh loop.
     - set_model() switches model and clears cache.
 
-    Example:
-        explainer = TriageExplainer(
-            model="llama-3.1-8b-instant",
-            api_key="gsk_..."        # or set GROQ_API_KEY env var
-        )
-
-        explainer.explain_async(record)          # fire and forget
-
-        result = explainer.get(patient_id)       # None if still loading
-        if result and result.is_ready:
-            print(result.escalation_reason)
     """
 
     def __init__(
