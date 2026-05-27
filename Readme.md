@@ -73,12 +73,10 @@ Safety pipeline adds negligible latency (<1ms) regardless of throughput — dete
 ---
 
 ## Live Demo
-
-**[View on Streamlit →](YOUR_STREAMLIT_URL)**
 Latency, Throughput, and Auditability tabs are populated from a pre-recorded run. The Triage tab requires a live Kafka connection.
 
-📹 **[Full system demo (YouTube) →](https://youtu.be/MDKxKKQBEN4?si=eE72GuH_LdN1Iz3l)**
+📹 **[Full system demo (YouTube)](https://youtu.be/MDKxKKQBEN4?si=eE72GuH_LdN1Iz3l)**
 
-📝 **[Medium writeup →](https://medium.com/@chaudharysaumya847/ktas-triage-detection-with-explainer-ai-f581918ab1ee)**
+📝 **[Medium writeup](https://medium.com/@chaudharysaumya847/ktas-triage-detection-with-explainer-ai-f581918ab1ee)**
 
-📝 **[Streamlit URL →](https://triageaiexplainer.streamlit.app/)**
+📝 **[Streamlit URL](https://triageaiexplainer.streamlit.app/)**
