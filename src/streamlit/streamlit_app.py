@@ -856,14 +856,11 @@ def render_dashboard(enrich_topic: str):
         st.markdown("### 🧠 LLM Enrichment")
         st.markdown(
             '<div style="color:#888;font-size:0.78rem;">'
-            'Groq is called by the <b>consumer</b>, not the UI.<br><br>'
             'Only escalation patients receive LLM review:<br>'
             '&bull; KTAS 1 or 2 prediction<br>'
             '&bull; Acuity conflict (predicted ≠ true)<br>'
             '&bull; Critical vital sign breach<br>'
             '&bull; Clinician override<br><br>'
-            'Set <code>$env:GROQ_API_KEY</code> and run the consumer — '
-            'explanations appear here automatically.'
             '</div>',
             unsafe_allow_html=True,
         )
